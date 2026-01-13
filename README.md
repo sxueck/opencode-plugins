@@ -9,17 +9,25 @@
 **解决的需求**
 - 进入会话后经常忘记手动命名，导致历史记录难以检索。
 - 首条用户问题通常已经能概括会话目标，适合作为会话标题。
-- 标题需要“更像人写的摘要”：去掉代码块、think 标签、命令前缀、常见客套/填充词，并控制长度。
+- 标题希望更像“人写的摘要”：以用户首句为种子，交给模型生成标题，并对输入/输出做清洗和长度控制。
 
 **行为说明**
-- 在会话的**第 1 条用户消息**到达后，自动将会话标题设置为该消息的清洗/截断版本。
-- 仅在用户消息数等于 1 时触发，避免在后续对话中反复改名。
+- 在会话的**第 1 条用户消息**到达后：抽取该消息的**第一句话**（忽略 synthetic 文本片段，去掉代码块、`<think>`、命令/@前缀等噪音），调用 OpenAI 生成标题，然后清洗/截断并更新会话标题。
+- 仅在“用户消息数等于 1”时触发，避免在后续对话中反复改名。
 - 会跳过 **subagent** 派生会话（检测 `parentID`），避免干扰子任务会话。
+- 触发事件以 `message.updated` / `message.part.updated` 为主；若错过消息事件，也会在会话 `idle` 时兜底尝试一次。
+
+**OpenAI 配置文件**
+- 默认读取 `~/.config/opencode/openai.jsonc`（支持 `//` 与 `/* */` 注释）。
+- 最少需要 `apiKey`（也兼容 `key/openaiApiKey/OPENAI_API_KEY/openai_api_key`）。
+- 可选：`baseURL`（默认 `https://api.openai.com/v1`）、`model`（默认 `gpt-4o-mini`）。
 
 **可配置项（环境变量）**
 - `OPENCODE_SESSION_AUTORENAME_ENABLED`：是否启用（默认 `true`）
 - `OPENCODE_SESSION_AUTORENAME_MAX_CHARS`：标题最大长度（默认 `50`，且强制不超过 50）
 - `OPENCODE_SESSION_AUTORENAME_MIN_CHARS`：触发/保留的最小长度（默认 `3`）
+- `OPENCODE_SESSION_AUTORENAME_OPENAI_TIMEOUT_MS`：OpenAI 请求超时（默认 `10000`）
+- `OPENCODE_SESSION_AUTORENAME_OPENAI_CONFIG`：OpenAI 配置文件路径（默认 `~/.config/opencode/openai.jsonc`）
 - `OPENCODE_SESSION_AUTORENAME_LOG_ON_LOAD`：加载时写入一条日志（默认 `false`）
 
 对应实现：`plugins/session-auto-rename.js`
@@ -79,17 +87,25 @@ This repository contains a small set of practical plugins for OpenCode. The focu
 **Problem it solves**
 - Sessions are often left unnamed, making history hard to search.
 - The first user message usually captures the goal of the session and works well as a title.
-- Titles should be human-friendly: remove code blocks, `<think>` tags, command prefixes, common filler phrases, and enforce a reasonable length.
+- Titles should feel human-friendly: use the first user sentence as a seed, generate a title via OpenAI, and sanitize/enforce length caps.
 
 **Behavior**
-- When the **first user message** arrives, the plugin derives a cleaned title and updates the session title.
+- When the **first user message** arrives, the plugin extracts the **first sentence** (ignores synthetic text parts; strips code blocks, `<think>` tags, command/@ prefixes), calls OpenAI to generate a title, then cleans/truncates it and updates the session title.
 - It triggers only when the total number of user messages is exactly 1, so it won’t keep renaming later.
 - It skips **subagent** sessions (detected via `parentID`) to avoid interfering with child-task sessions.
+- Primary triggers are `message.updated` / `message.part.updated`; if those are missed, it also attempts once when the session becomes `idle`.
+
+**OpenAI config file**
+- Default path: `~/.config/opencode/openai.jsonc` (JSONC supported via comment stripping).
+- Required: `apiKey` (also accepts `key/openaiApiKey/OPENAI_API_KEY/openai_api_key`).
+- Optional: `baseURL` (default `https://api.openai.com/v1`), `model` (default `gpt-4o-mini`).
 
 **Configuration (environment variables)**
 - `OPENCODE_SESSION_AUTORENAME_ENABLED` (default: `true`)
 - `OPENCODE_SESSION_AUTORENAME_MAX_CHARS` (default: `50`, hard-capped at 50)
 - `OPENCODE_SESSION_AUTORENAME_MIN_CHARS` (default: `3`)
+- `OPENCODE_SESSION_AUTORENAME_OPENAI_TIMEOUT_MS` (default: `10000`)
+- `OPENCODE_SESSION_AUTORENAME_OPENAI_CONFIG` (default: `~/.config/opencode/openai.jsonc`)
 - `OPENCODE_SESSION_AUTORENAME_LOG_ON_LOAD` (default: `false`)
 
 Implementation: `plugins/session-auto-rename.js`

@@ -11,6 +11,12 @@ function booleanFromEnv(name, fallback) {
   return raw === "1" || raw.toLowerCase() === "true" || raw.toLowerCase() === "yes";
 }
 
+function stringFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  return raw;
+}
+
 /**
  * Extract only user-authored text parts.
  * OpenCode message parts may include synthetic content that should not influence titles.
@@ -49,38 +55,19 @@ function stripNoise(text) {
   return cleaned.trim();
 }
 
+function stripJsonComments(text) {
+  // Minimal JSONC support: strip // and /* */ comments.
+  // This is intentionally simple; keep config files straightforward.
+  let out = String(text ?? "");
+  out = out.replace(/\/\*[\s\S]*?\*\//g, "");
+  out = out.replace(/(^|[^:])\/\/.*$/gm, "$1");
+  return out;
+}
+
 function truncateToChars(text, maxChars) {
   const s = String(text ?? "").trim();
   if (s.length <= maxChars) return s;
   return s.slice(0, Math.max(0, maxChars)).trimEnd();
-}
-
-function stripFillerPhrases(text) {
-  let s = String(text ?? "").trim();
-
-  // Strip some common leading polite/filler phrases (conservative).
-  // Keep this list short to avoid removing meaningful content.
-  const leadingPatterns = [
-    /^\s*(?:请|麻烦|劳烦)\s*(?:帮我|帮忙)?\s*/,
-    /^\s*(?:帮我|帮忙)\s*/,
-    /^\s*(?:能不能|能否|可以不可以|可不可以)\s*/,
-    /^\s*(?:我想|我需要|我要|想要|希望|需要)\s*/,
-    /^\s*(?:例如|比如)(?:的)?\s*/,
-    /^\s*(?:这个|这种|这样的|这类|此类)\s*/,
-  ];
-
-  for (const re of leadingPatterns) s = s.replace(re, "");
-
-  // Strip some common trailing filler phrases.
-  s = s.replace(/\s*(?:之类的?|等等|什么的|啥的)\s*$/g, "");
-
-  // Specific phrasing like "这个之类的" usually carries no meaning.
-  s = s.replace(/\s*这个之类的?\s*/g, " ");
-
-  // Collapse whitespace again.
-  s = s.replace(/\s+/g, " ").trim();
-
-  return s;
 }
 
 function cleanTitle(raw, maxChars) {
@@ -90,24 +77,85 @@ function cleanTitle(raw, maxChars) {
   return truncateToChars(cleaned, maxChars);
 }
 
-function takeFirstSentence(text) {
-  const s = String(text ?? "").trim();
-  const idx = s.search(/[。！？!?]/);
-  if (idx === -1) return s;
-  return s.slice(0, idx).trim();
+async function readOpenAIConfig(path) {
+  const { readFile } = await import("fs/promises");
+  const raw = await readFile(path, "utf8");
+  const parsed = JSON.parse(stripJsonComments(raw));
+  return parsed && typeof parsed === "object" ? parsed : {};
 }
 
-function cleanUserTitle(raw, maxChars) {
-  const limit = Math.min(30, Math.max(1, Number(maxChars) || 30));
+function firstSentence(text) {
+  const cleaned = stripNoise(text);
+  if (!cleaned) return "";
 
-  const base = cleanTitle(raw, Math.max(limit, 80));
-  const stripped = stripFillerPhrases(base);
-  const firstSentence = takeFirstSentence(stripped || base);
+  // Split on common sentence terminators (Chinese + English).
+  // Keep it conservative to avoid chopping on abbreviations.
+  const match = cleaned.match(/^(.+?)(?:[。！？!?](?:\s|$)|\.(?:\s|$)|\n|\r|$)/);
+  const candidate = (match?.[1] ?? cleaned).trim();
 
-  const normalized = String(firstSentence).replace(/^\s*的\s*/, "").trim();
-
-  return truncateToChars(normalized || firstSentence || stripped || base, limit);
+  // If the first sentence is too short, fall back to the full cleaned text.
+  return candidate.length >= 2 ? candidate : cleaned;
 }
+
+async function openaiGenerateTitleFromText({
+  apiKey,
+  baseURL,
+  model,
+  text,
+  maxChars,
+  timeoutMs,
+}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const url = `${String(baseURL).replace(/\/$/, "")}/chat/completions`;
+
+    const trimmed = truncateToChars(String(text ?? ""), 3000);
+
+    const body = {
+      model,
+      temperature: 0.2,
+      max_tokens: 120,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是会话标题生成器。根据用户第一句话生成会话标题。只输出标题，不要解释。标题不超过50字。",
+        },
+        {
+          role: "user",
+          content: `用户第一句话：\n${trimmed}\n\n请输出标题：`,
+        },
+      ],
+    };
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`OpenAI HTTP ${res.status}: ${text.slice(0, 500)}`);
+    }
+
+    const json = await res.json();
+    const content = json?.choices?.[0]?.message?.content;
+    if (typeof content !== "string") return null;
+
+    // Enforce 50 chars max (ignore env maxChars beyond 50 per requirement).
+    return cleanTitle(content, Math.min(50, maxChars));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 
 async function safeLog(client, level, message, extra) {
   try {
@@ -140,6 +188,35 @@ async function safeLog(client, level, message, extra) {
   }
 }
 
+async function safeToast(client, variant, title, message, duration = 5000) {
+  try {
+    if (!client?.tui?.showToast) return;
+
+    try {
+      await client.tui.showToast({
+        body: {
+          title,
+          message,
+          variant,
+          duration,
+        },
+      });
+      return;
+    } catch {
+      // Fall back to potential direct signature.
+    }
+
+    await client.tui.showToast({
+      title,
+      message,
+      variant,
+      duration,
+    });
+  } catch {
+    // Ignore toast errors.
+  }
+}
+
 async function isSubagentSession(client, sessionID) {
   try {
     const result = await client.session.get({ path: { id: sessionID } });
@@ -156,6 +233,8 @@ function findFirstUserMessage(messages) {
   }
   return null;
 }
+
+
 
 function countUserMessages(messages) {
   if (!Array.isArray(messages)) return 0;
@@ -180,28 +259,98 @@ function getSessionIDFromEvent(event) {
   );
 }
 
+function extractUserTextFromEvent(event) {
+  const props = event?.properties;
+  const message = props?.message;
+
+  const role = message?.info?.role || message?.role || props?.role || null;
+  if (role !== "user") return "";
+
+  const directText = extractTextOnly(message?.parts);
+  if (directText) return directText;
+
+  // Some message-part events include a single part.
+  const part = props?.part || props?.messagePart;
+  if (part?.type === "text" && !part?.synthetic && typeof part.text === "string") {
+    return part.text.trim();
+  }
+
+  return "";
+}
+
 const renamedOnce = new Set();
 const inFlight = new Map();
+const toastShown = new Set();
+
 
 export const SessionAutoRename = async ({ client }) => {
   const enabled = booleanFromEnv("OPENCODE_SESSION_AUTORENAME_ENABLED", true);
   if (!enabled) return {};
 
+  // Requirement: use the first user sentence as summary/title source.
+
   const maxChars = numberFromEnv("OPENCODE_SESSION_AUTORENAME_MAX_CHARS", 50);
   const minChars = numberFromEnv("OPENCODE_SESSION_AUTORENAME_MIN_CHARS", 3);
+  const timeoutMs = numberFromEnv("OPENCODE_SESSION_AUTORENAME_OPENAI_TIMEOUT_MS", 10_000);
   const logOnLoad = booleanFromEnv("OPENCODE_SESSION_AUTORENAME_LOG_ON_LOAD", false);
 
-  const effectiveMaxChars = Math.min(50, maxChars);
+
+  const { join } = await import("path");
+  const { homedir } = await import("os");
+
+  const openaiConfigPath = stringFromEnv(
+    "OPENCODE_SESSION_AUTORENAME_OPENAI_CONFIG",
+    join(homedir(), ".config", "opencode", "openai.jsonc"),
+  );
 
   if (logOnLoad) {
     void safeLog(client, "info", "SessionAutoRename plugin loaded", {
       enabled,
-      maxChars: effectiveMaxChars,
+      maxChars: Math.min(50, maxChars),
       minChars,
+      openaiConfigPath,
+      timeoutMs,
     });
   }
 
-  async function maybeRenameOnFirstMessage(sessionID) {
+  let missingKeyToastShown = false;
+
+  async function loadOpenAISettings() {
+    const config = await readOpenAIConfig(openaiConfigPath);
+    const configPathUsed = openaiConfigPath;
+
+    const apiKey =
+      config.apiKey ||
+      config.key ||
+      config.openaiApiKey ||
+      config.OPENAI_API_KEY ||
+      config.openai_api_key;
+
+    const baseURL = config.baseURL || config.baseUrl || "https://api.openai.com/v1";
+    const model = config.model || "gpt-4o-mini";
+
+    if (!apiKey || typeof apiKey !== "string" || apiKey.trim() === "") {
+      if (!missingKeyToastShown) {
+        missingKeyToastShown = true;
+        void safeToast(
+          client,
+          "error",
+          "Session auto-rename",
+          `Missing OpenAI apiKey in ${configPathUsed} (apiKey/key)`,
+          8000,
+        );
+      }
+      throw new Error(
+        `Missing OpenAI apiKey in ${configPathUsed}. Expected { apiKey: "..." } or { key: "..." }`,
+      );
+    }
+
+
+    return { apiKey: apiKey.trim(), baseURL, model, configPathUsed };
+  }
+
+
+  async function maybeRenameOnFirstMessage(sessionID, seedFromEvent) {
     if (!sessionID) return;
     if (renamedOnce.has(sessionID)) return;
     if (inFlight.has(sessionID)) return inFlight.get(sessionID);
@@ -210,18 +359,53 @@ export const SessionAutoRename = async ({ client }) => {
       try {
         if (await isSubagentSession(client, sessionID)) return;
 
-        const { data: messages } = await client.session.messages({ path: { id: sessionID } });
+        let confirmedFirstUserMessage = false;
+        let userText = "";
 
-        // Only rename on the very first user message.
-        if (countUserMessages(messages) !== 1) return;
+        // Source of truth: the stored first user message.
+        // Retry a few times since the message event may fire before persistence.
+        const maxAttempts = 8;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const { data: messages } = await client.session.messages({ path: { id: sessionID } });
 
-        const firstUserMessage = findFirstUserMessage(messages);
-        const userText = firstUserMessage ? extractTextOnly(firstUserMessage.parts) : "";
+          // Only rename based on brand-new sessions (exactly one user message).
+          if (countUserMessages(messages) !== 1) return;
+          confirmedFirstUserMessage = true;
+
+          const firstUserMessage = findFirstUserMessage(messages);
+          userText = firstUserMessage ? extractTextOnly(firstUserMessage.parts) : "";
+
+          if (userText.length >= minChars) break;
+
+          await new Promise((resolve) => setTimeout(resolve, 150 + attempt * 120));
+        }
+
+        // If the stored message has no text parts yet, fall back to the event text.
+        if (userText.length < minChars && confirmedFirstUserMessage) {
+          userText = String(seedFromEvent ?? "").trim();
+        }
 
         if (userText.length < minChars) return;
 
-        const title = cleanUserTitle(userText, effectiveMaxChars);
+        const seed = firstSentence(userText);
+
+        const { apiKey, baseURL, model } = await loadOpenAISettings();
+        const title = await openaiGenerateTitleFromText({
+          apiKey,
+          baseURL,
+          model,
+          text: seed,
+          maxChars: Math.min(50, maxChars),
+          timeoutMs,
+        });
+
         if (!title || title.length < minChars) return;
+
+        void safeLog(client, "info", "Session title auto-generated (OpenAI)", {
+          sessionID,
+          title,
+          model,
+        });
 
         await client.session.update({
           path: { id: sessionID },
@@ -229,17 +413,23 @@ export const SessionAutoRename = async ({ client }) => {
         });
 
         renamedOnce.add(sessionID);
-
-        void safeLog(client, "info", "Session title set from first user message", {
-          sessionID,
-          title,
-        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         void safeLog(client, "warn", "Session auto-rename failed", {
           sessionID,
           error: message,
         });
+
+        if (!toastShown.has(sessionID)) {
+          toastShown.add(sessionID);
+          void safeToast(
+            client,
+            "warning",
+            "Session auto-rename",
+            message,
+            8000,
+          );
+        }
       } finally {
         inFlight.delete(sessionID);
       }
@@ -249,27 +439,28 @@ export const SessionAutoRename = async ({ client }) => {
     return promise;
   }
 
+
   return {
     event: async ({ event }) => {
-      const sessionID = getSessionIDFromEvent(event);
       const type = event?.type;
+      const sessionID = getSessionIDFromEvent(event);
 
-      // Prefer renaming as soon as the first user message arrives.
-      // message.updated behaves like an upsert and is the earliest stable hook.
-      if (type === "message.updated") {
-        void maybeRenameOnFirstMessage(sessionID);
+      if (type === "message.updated" || type === "message.part.updated") {
+        const seedFromEvent = extractUserTextFromEvent(event);
+        if (sessionID && seedFromEvent.length >= minChars) {
+          void maybeRenameOnFirstMessage(sessionID, seedFromEvent);
+        }
+        return;
       }
 
-      // Fallback hooks in case some clients don't emit message events.
-      if (type === "session.status" && event?.properties?.status?.type === "idle") {
-        // @ts-ignore
-        void maybeRenameOnFirstMessage(event.properties.sessionID);
-      }
-
-      if (type === "session.idle") {
-        // @ts-ignore
-        void maybeRenameOnFirstMessage(event?.properties?.sessionID);
+      // Fallback: if we miss message events, idle will still attempt rename.
+      if (
+        (type === "session.status" && event?.properties?.status?.type === "idle") ||
+        type === "session.idle"
+      ) {
+        if (sessionID) void maybeRenameOnFirstMessage(sessionID, "");
       }
     },
   };
 };
+
