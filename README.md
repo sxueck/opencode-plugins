@@ -61,8 +61,6 @@
 2. 在 OpenCode 的插件配置里注册对应导出（`SessionAutoRename` / `ToolOutputTruncator`）；
 3. 通过环境变量按需开启/调整阈值。
 
-如果你告诉我你当前使用的 OpenCode 版本以及插件是通过哪个入口加载（配置文件/CLI 参数/代码注册），我可以把这一节补成可直接复制的配置示例。
-
 ---
 
 # English Version
@@ -131,4 +129,3 @@ In general:
 2. Register the exported plugin entry points (`SessionAutoRename` / `ToolOutputTruncator`);
 3. Tune behavior using the environment variables above.
 
-If you share your OpenCode version and the plugin loading mechanism you’re using, I can provide a copy-pasteable configuration snippet for your setup.
